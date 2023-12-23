@@ -1,39 +1,41 @@
-//! Blinks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
 #![no_std]
 #![no_main]
 
-use bsp::entry;
-use defmt::*;
-use defmt_rtt as _;
-use embedded_hal::digital::v2::OutputPin;
-use panic_probe as _;
-
-// Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
-
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
-    pac,
-    sio::Sio,
-    watchdog::Watchdog,
+use adafruit_macropad as bsp;
+use bsp::{
+    entry,
+    hal::{
+        self,
+        clocks::{init_clocks_and_plls, Clock},
+        gpio::{FunctionSpi, PullNone, PullUp},
+        pac,
+        pio::PIOExt,
+        sio::Sio,
+        watchdog::Watchdog,
+        Timer,
+    },
 };
+use display::Screen;
+use embedded_hal::digital::v2::InputPin;
+use embedded_hal::digital::v2::OutputPin;
+use hal::fugit::RateExtU32;
+use leds::LedController;
+use panic_halt as _;
+use sh1106::{mode::GraphicsMode, Builder};
+use ws2812_pio::Ws2812;
+
+mod display;
+mod leds;
 
 #[entry]
 fn main() -> ! {
-    info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
-    // External high-speed crystal on the pico board is 12Mhz
-    let external_xtal_freq_hz = 12_000_000u32;
     let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
+        bsp::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -45,6 +47,9 @@ fn main() -> ! {
     .unwrap();
 
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let sin = hal::rom_data::float_funcs::fsin::ptr();
 
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
@@ -53,21 +58,63 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead. If you have
-    // a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here.
-    let mut led_pin = pins.led.into_push_pull_output();
+    let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
 
+    let ws = Ws2812::new(
+        pins.neopixel.into_function(),
+        &mut pio,
+        sm0,
+        clocks.peripheral_clock.freq(),
+        timer.count_down(),
+    );
+
+    let spi = hal::spi::Spi::<_, _, _>::new(
+        pac.SPI1,
+        (
+            pins.mosi.reconfigure::<FunctionSpi, PullNone>(),
+            pins.miso.reconfigure::<FunctionSpi, PullUp>(),
+            pins.sclk.reconfigure::<FunctionSpi, PullNone>(),
+        ),
+    );
+
+    let spi = spi.init(
+        &mut pac.RESETS,
+        clocks.peripheral_clock.freq(),
+        4.MHz(),
+        embedded_hal::spi::MODE_0,
+    );
+
+    let display: GraphicsMode<_> = Builder::new()
+        .connect_spi(
+            spi,
+            pins.oled_dc.into_push_pull_output(),
+            pins.oled_cs.into_push_pull_output(),
+        )
+        .into();
+
+    pins.oled_reset.into_push_pull_output().set_high().unwrap();
+
+    let mut screen_controller = Screen::new(display).unwrap();
+    let mut led_controller = LedController::new(ws, sin);
+
+    screen_controller.write("Hello World").unwrap();
+
+    let mut t = 0.0;
+
+    // Slow down timer by this factor (0.1 will result in 10 seconds):
+    let animation_speed = 0.1;
+
+    let encoder = pins.button.into_pull_up_input();
     loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        led_controller.next_frame(t);
+
+        delay.delay_ms(16); // ~60 FPS
+
+        if encoder.is_low().unwrap() {
+            t += (16.0 / 1000.0) * animation_speed;
+            while t > 1.0 {
+                t -= 1.0;
+            }
+        }
     }
 }
-
-// End of file
