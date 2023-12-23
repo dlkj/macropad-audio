@@ -7,9 +7,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
-embedded-hal = { version = "0.2.5", features = ["unproven"] }
+embedded-hal = { version = "0.2", features = ["unproven"] }
 panic-halt = "0.2.0"
 adafruit-macropad = "0.7"
+critical-section = "1.1"
 
 embedded-graphics = "0.8"
 embedded-text = "0.7"
