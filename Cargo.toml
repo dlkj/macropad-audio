@@ -12,12 +12,15 @@ panic-halt = "0.2.0"
 adafruit-macropad = "0.7"
 critical-section = "1.1"
 
+num-traits = { version = "0.2", default-features = false }
 embedded-graphics = "0.8"
 embedded-text = "0.7"
 ws2812-pio = "0.7.0"
 smart-leds = "0.3.0"
 sh1106 = "0.5.0"
 heapless = "0.8"
+micromath = "2.1"
+portable-atomic = { version = "1.6", features = ["critical-section"] }
 
 # cargo build/run
 [profile.dev]
