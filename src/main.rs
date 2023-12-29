@@ -9,8 +9,9 @@ use bsp::{
         clocks::{init_clocks_and_plls, Clock},
         fugit::ExtU64,
         gpio::{
-            bank0::{Gpio17, Gpio18},
-            FunctionSio, FunctionSpi, Interrupt, Pin, PullNone, PullUp, SioInput,
+            bank0::{Gpio17, Gpio18, Gpio23},
+            DynPinId, FunctionSio, FunctionSioOutput, FunctionSpi, Interrupt, Pin, PullDown,
+            PullNone, PullUp, SioInput,
         },
         pac::{self, interrupt},
         pio::PIOExt,
@@ -21,8 +22,15 @@ use bsp::{
         Timer,
     },
 };
-use core::{cell::Cell, fmt::Write};
-use cortex_m::asm::wfe;
+use core::{
+    cell::Cell,
+    fmt::{Debug, Write},
+};
+use cortex_m::{
+    asm::wfe,
+    peripheral::{syst::SystClkSource, SYST},
+};
+use cortex_m_rt::exception;
 use critical_section::Mutex;
 use display::Screen;
 use embedded_hal::digital::v2::InputPin;
@@ -30,9 +38,9 @@ use embedded_hal::digital::v2::OutputPin;
 use hal::fugit::RateExtU32;
 use heapless::String;
 use leds::LedController;
-use panic_halt as _;
+use panic_persist as _;
 use portable_atomic::{AtomicI32, AtomicU16};
-use sh1106::{mode::GraphicsMode, Builder};
+use sh1106::{interface::DisplayInterface, mode::GraphicsMode, Builder};
 use synth::Synth;
 use ws2812_pio::Ws2812;
 
@@ -56,6 +64,11 @@ fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
+    let mut core = pac::CorePeripherals::take().unwrap();
+    core.SYST.set_clock_source(SystClkSource::Core);
+    core.SYST.set_reload(SYST::get_ticks_per_10ms());
+    core.SYST.clear_current();
+    core.SYST.enable_counter();
 
     let clocks = init_clocks_and_plls(
         bsp::XOSC_CRYSTAL_FREQ,
@@ -69,25 +82,11 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
-
-    let sin = hal::rom_data::float_funcs::fsin::ptr();
-
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
-    );
-
-    let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
-
-    let ws = Ws2812::new(
-        pins.neopixel.into_function(),
-        &mut pio,
-        sm0,
-        clocks.peripheral_clock.freq(),
-        timer.count_down(),
     );
 
     let spi = hal::spi::Spi::<_, _, _>::new(
@@ -113,6 +112,23 @@ fn main() -> ! {
         )
         .into();
 
+    let mut oled_reset = pins.oled_reset.into_push_pull_output();
+    let display = check_for_panic(&mut oled_reset, display);
+
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let sin = hal::rom_data::float_funcs::fsin::ptr();
+
+    let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
+
+    let ws = Ws2812::new(
+        pins.neopixel.into_function(),
+        &mut pio,
+        sm0,
+        clocks.peripheral_clock.freq(),
+        timer.count_down(),
+    );
+
     let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
     let mut pwm = pwm_slices.pwm0;
     pwm.channel_a.output_to(pins.speaker);
@@ -129,16 +145,12 @@ fn main() -> ! {
         IRQ_SYNTH.borrow(cs).set(Some(Synth::new(pwm)));
     });
 
-    unsafe {
-        pac::NVIC::unmask(pac::Interrupt::PWM_IRQ_WRAP);
-    }
-
     pins.speaker_shutdown
         .into_push_pull_output()
         .set_high()
         .unwrap();
 
-    pins.oled_reset.into_push_pull_output().set_high().unwrap();
+    oled_reset.set_high().unwrap();
 
     let key1 = pins.key1.into_pull_up_input();
     let key2 = pins.key2.into_pull_up_input();
@@ -154,23 +166,23 @@ fn main() -> ! {
     let key12 = pins.key12.into_pull_up_input();
     let button = pins.button.into_pull_up_input();
     let encoder_rota = pins.encoder_rota.into_pull_up_input();
-    encoder_rota.set_interrupt_enabled(Interrupt::EdgeHigh, true);
-    encoder_rota.set_interrupt_enabled(Interrupt::EdgeLow, true);
     let encoder_rotb = pins.encoder_rotb.into_pull_up_input();
-    encoder_rotb.set_interrupt_enabled(Interrupt::EdgeHigh, true);
-    encoder_rotb.set_interrupt_enabled(Interrupt::EdgeLow, true);
 
     critical_section::with(|cs| {
         IRQ_ENCODER_PINS
             .borrow(cs)
             .set(Some((encoder_rota, encoder_rotb)));
     });
-    unsafe {
-        pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
-    }
 
     let mut screen_controller = Screen::new(display).unwrap();
     let mut led_controller = LedController::new(ws, sin);
+
+    // Enable interrupts
+    core.SYST.enable_interrupt();
+    unsafe {
+        pac::NVIC::unmask(pac::Interrupt::PWM_IRQ_WRAP);
+        pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
+    }
 
     // Slow down timer by this factor (0.1 will result in 10 seconds):
     let animation_speed = 0.1;
@@ -179,7 +191,6 @@ fn main() -> ! {
     let mut next_frame = Instant::from_ticks(0);
     loop {
         let now = timer.get_counter();
-
         if now > next_frame {
             if button.is_low().unwrap() {
                 led_controller.next_frame(t);
@@ -223,7 +234,7 @@ fn main() -> ! {
                 s,
                 "Frequency: {} Hz\nEncoder: {}",
                 WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
-                ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed)
+                ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
             )
             .unwrap();
             screen_controller.write(&s).unwrap();
@@ -231,6 +242,27 @@ fn main() -> ! {
 
         // PWM will fire regularly, might as well sleep
         wfe()
+    }
+}
+
+fn check_for_panic<DI>(
+    pin: &mut Pin<Gpio23, FunctionSioOutput, PullDown>,
+    display: GraphicsMode<DI>,
+) -> GraphicsMode<DI>
+where
+    <DI as DisplayInterface>::Error: Debug,
+    DI: DisplayInterface,
+{
+    if let Some(panic) = panic_persist::get_panic_message_utf8() {
+        pin.set_high().unwrap();
+        let mut screen_controller = Screen::new(display).unwrap();
+
+        screen_controller.write(panic).unwrap();
+        loop {
+            wfe();
+        }
+    } else {
+        display
     }
 }
 
@@ -308,4 +340,37 @@ fn IO_IRQ_BANK0() {
         enc_rot_b.clear_interrupt(Interrupt::EdgeHigh);
         enc_rot_b.clear_interrupt(Interrupt::EdgeLow);
     }
+}
+
+#[exception]
+fn SysTick() {
+    // Update buttons
+
+    // Update encoder
+}
+
+struct Buttons<const N: usize> {
+    button_pins: [Pin<DynPinId, FunctionSioOutput, PullUp>; N],
+}
+
+impl<const N: usize> Buttons<N> {
+    fn get_buttons(&self) -> [bool; N] {
+        todo!()
+    }
+}
+
+struct Encoder {
+    pin_a: Pin<DynPinId, FunctionSioOutput, PullUp>,
+    pin_b: Pin<DynPinId, FunctionSioOutput, PullUp>,
+}
+
+impl Encoder {
+    fn get_encoder(&self) -> EncoderValue {
+        todo!()
+    }
+}
+enum EncoderValue {
+    Clockwise,
+    Anticlockwise,
+    None,
 }
