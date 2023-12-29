@@ -7,15 +7,19 @@ use bsp::{
     hal::{
         self,
         clocks::{init_clocks_and_plls, Clock},
-        fugit::ExtU64,
+        dma::{double_buffer, DMAExt},
+        fugit::{ExtU64, MicrosDurationU64},
         gpio::{
-            bank0::{Gpio17, Gpio18, Gpio23},
-            DynPinId, FunctionSio, FunctionSioOutput, FunctionSpi, Interrupt, Pin, PullDown,
-            PullNone, PullUp, SioInput,
+            bank0::{
+                Gpio0, Gpio1, Gpio10, Gpio11, Gpio12, Gpio17, Gpio18, Gpio2, Gpio23, Gpio3, Gpio4,
+                Gpio5, Gpio6, Gpio7, Gpio8, Gpio9,
+            },
+            FunctionSio, FunctionSioOutput, FunctionSpi, Pin, PinGroup, PullDown, PullNone, PullUp,
+            SioInput,
         },
-        pac::{self, interrupt},
+        pac::{self},
         pio::PIOExt,
-        pwm::Pwm0,
+        pwm::{CcFormat, SliceDmaWrite},
         sio::Sio,
         timer::Instant,
         watchdog::Watchdog,
@@ -27,16 +31,17 @@ use core::{
     fmt::{Debug, Write},
 };
 use cortex_m::{
-    asm::wfe,
+    asm::wfi,
     peripheral::{syst::SystClkSource, SYST},
+    singleton,
 };
 use cortex_m_rt::exception;
 use critical_section::Mutex;
 use display::Screen;
-use embedded_hal::digital::v2::InputPin;
 use embedded_hal::digital::v2::OutputPin;
+use frunk_core::hlist::{HCons, HNil};
 use hal::fugit::RateExtU32;
-use heapless::String;
+use heapless::{mpmc::Q64, String};
 use leds::LedController;
 use panic_persist as _;
 use portable_atomic::{AtomicI32, AtomicU16};
@@ -48,14 +53,68 @@ mod display;
 mod leds;
 mod synth;
 
-type EncoderRotAPin = Pin<Gpio17, FunctionSio<SioInput>, PullUp>;
-type EncoderRotBPin = Pin<Gpio18, FunctionSio<SioInput>, PullUp>;
+type InputPinGroup = PinGroup<
+    HCons<
+        Pin<Gpio18, FunctionSio<SioInput>, PullUp>,
+        HCons<
+            Pin<Gpio17, FunctionSio<SioInput>, PullUp>,
+            HCons<
+                Pin<Gpio0, FunctionSio<SioInput>, PullUp>,
+                HCons<
+                    Pin<Gpio12, FunctionSio<SioInput>, PullUp>,
+                    HCons<
+                        Pin<Gpio11, FunctionSio<SioInput>, PullUp>,
+                        HCons<
+                            Pin<Gpio10, FunctionSio<SioInput>, PullUp>,
+                            HCons<
+                                Pin<Gpio9, FunctionSio<SioInput>, PullUp>,
+                                HCons<
+                                    Pin<Gpio8, FunctionSio<SioInput>, PullUp>,
+                                    HCons<
+                                        Pin<Gpio7, FunctionSio<SioInput>, PullUp>,
+                                        HCons<
+                                            Pin<Gpio6, FunctionSio<SioInput>, PullUp>,
+                                            HCons<
+                                                Pin<Gpio5, FunctionSio<SioInput>, PullUp>,
+                                                HCons<
+                                                    Pin<Gpio4, FunctionSio<SioInput>, PullUp>,
+                                                    HCons<
+                                                        Pin<Gpio3, FunctionSio<SioInput>, PullUp>,
+                                                        HCons<
+                                                            Pin<
+                                                                Gpio2,
+                                                                FunctionSio<SioInput>,
+                                                                PullUp,
+                                                            >,
+                                                            HCons<
+                                                                Pin<
+                                                                    Gpio1,
+                                                                    FunctionSio<SioInput>,
+                                                                    PullUp,
+                                                                >,
+                                                                HNil,
+                                                            >,
+                                                        >,
+                                                    >,
+                                                >,
+                                            >,
+                                        >,
+                                    >,
+                                >,
+                            >,
+                        >,
+                    >,
+                >,
+            >,
+        >,
+    >,
+>;
 
 static WAVE_TYPE: AtomicU16 = AtomicU16::new(0);
 static ENCODER_VALUE: AtomicI32 = AtomicI32::new(0);
-static IRQ_SYNTH: Mutex<Cell<Option<Synth<Pwm0>>>> = Mutex::new(Cell::new(None));
-static IRQ_ENCODER_PINS: Mutex<Cell<Option<(EncoderRotAPin, EncoderRotBPin)>>> =
-    Mutex::new(Cell::new(None));
+static INPUT_PIN_GROUP: Mutex<Cell<Option<InputPinGroup>>> = Mutex::new(Cell::new(None));
+
+static INPUT_QUEUE: Q64<u32> = Q64::new();
 
 const PWM_MAX: u16 = 4096;
 
@@ -138,12 +197,16 @@ fn main() -> ! {
     //     / (PWM_MAX as f32 * (1.0 + PWM_DIV_FRAC as f32 / 16.0))) as u16;
     pwm.set_top(PWM_MAX);
     pwm.set_div_frac(PWM_DIV_FRAC);
-    pwm.enable_interrupt();
     pwm.enable();
 
-    critical_section::with(|cs| {
-        IRQ_SYNTH.borrow(cs).set(Some(Synth::new(pwm)));
-    });
+    let buf = singleton!(: [CcFormat; 220] = [CcFormat{a: PWM_MAX/2, b: PWM_MAX/2}; 220]).unwrap();
+    let buf2 = singleton!(: [CcFormat; 220] = [CcFormat{a: PWM_MAX/2, b: PWM_MAX/2}; 220]).unwrap();
+
+    let dma = pac.DMA.split(&mut pac.RESETS);
+
+    let dma_pwm = SliceDmaWrite::from(pwm);
+
+    let dma_pwm_conf = double_buffer::Config::new((dma.ch0, dma.ch1), buf, dma_pwm.cc);
 
     pins.speaker_shutdown
         .into_push_pull_output()
@@ -152,26 +215,24 @@ fn main() -> ! {
 
     oled_reset.set_high().unwrap();
 
-    let key1 = pins.key1.into_pull_up_input();
-    let key2 = pins.key2.into_pull_up_input();
-    let key3 = pins.key3.into_pull_up_input();
-    let key4 = pins.key4.into_pull_up_input();
-    let key5 = pins.key5.into_pull_up_input();
-    let key6 = pins.key6.into_pull_up_input();
-    let key7 = pins.key7.into_pull_up_input();
-    let key8 = pins.key8.into_pull_up_input();
-    let key9 = pins.key9.into_pull_up_input();
-    let key10 = pins.key10.into_pull_up_input();
-    let key11 = pins.key11.into_pull_up_input();
-    let key12 = pins.key12.into_pull_up_input();
-    let button = pins.button.into_pull_up_input();
-    let encoder_rota = pins.encoder_rota.into_pull_up_input();
-    let encoder_rotb = pins.encoder_rotb.into_pull_up_input();
-
+    let input_pins = PinGroup::new();
+    let input_pins = input_pins.add_pin(pins.key1.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key2.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key3.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key4.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key5.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key6.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key7.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key8.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key9.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key10.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key11.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.key12.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.button.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.encoder_rota.into_pull_up_input());
+    let input_pins = input_pins.add_pin(pins.encoder_rotb.into_pull_up_input());
     critical_section::with(|cs| {
-        IRQ_ENCODER_PINS
-            .borrow(cs)
-            .set(Some((encoder_rota, encoder_rotb)));
+        INPUT_PIN_GROUP.borrow(cs).set(Some(input_pins));
     });
 
     let mut screen_controller = Screen::new(display).unwrap();
@@ -179,69 +240,88 @@ fn main() -> ! {
 
     // Enable interrupts
     core.SYST.enable_interrupt();
-    unsafe {
-        pac::NVIC::unmask(pac::Interrupt::PWM_IRQ_WRAP);
-        pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
-    }
 
+    // Start DMA
+    let mut pwm_transfer = dma_pwm_conf.start().read_next(buf2);
     // Slow down timer by this factor (0.1 will result in 10 seconds):
     let animation_speed = 0.1;
     let mut t = 0.0;
 
     let mut next_frame = Instant::from_ticks(0);
+
+    let mut input = 0;
+    let mut screen = MicrosDurationU64::from_ticks(0);
+    let mut synth = Synth::new();
     loop {
         let now = timer.get_counter();
-        if now > next_frame {
-            if button.is_low().unwrap() {
-                led_controller.next_frame(t);
-                t += (16.0 / 1000.0) * animation_speed;
-                while t > 1.0 {
-                    t -= 1.0;
-                }
-                next_frame = now + 16u64.millis();
+        while let Some(next_input) = INPUT_QUEUE.dequeue() {
+            input = next_input;
+        }
+
+        if pwm_transfer.is_done() {
+            WAVE_TYPE.store(
+                match input {
+                    i if (i >> 1 & 1) == 0 => 262,
+                    i if (i >> 2 & 1) == 0 => 294,
+                    i if (i >> 3 & 1) == 0 => 330,
+                    i if (i >> 4 & 1) == 0 => 349,
+                    i if (i >> 5 & 1) == 0 => 392,
+                    i if (i >> 6 & 1) == 0 => 440,
+                    i if (i >> 7 & 1) == 0 => 494,
+                    i if (i >> 8 & 1) == 0 => 523,
+                    i if (i >> 9 & 1) == 0 => 587,
+                    i if (i >> 10 & 1) == 0 => 659,
+                    i if (i >> 11 & 1) == 0 => 699,
+                    i if (i >> 12 & 1) == 0 => 784,
+                    _ => 0,
+                },
+                core::sync::atomic::Ordering::Relaxed,
+            );
+
+            let (buf, done_transfer) = pwm_transfer.wait();
+
+            for s in buf.iter_mut() {
+                s.a = synth.next_sample(
+                    WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
+                    ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
+                )
             }
 
-            if key1.is_low().unwrap() {
-                WAVE_TYPE.store(262, core::sync::atomic::Ordering::Relaxed);
-            } else if key2.is_low().unwrap() {
-                WAVE_TYPE.store(294, core::sync::atomic::Ordering::Relaxed);
-            } else if key3.is_low().unwrap() {
-                WAVE_TYPE.store(330, core::sync::atomic::Ordering::Relaxed);
-            } else if key4.is_low().unwrap() {
-                WAVE_TYPE.store(349, core::sync::atomic::Ordering::Relaxed);
-            } else if key5.is_low().unwrap() {
-                WAVE_TYPE.store(392, core::sync::atomic::Ordering::Relaxed);
-            } else if key6.is_low().unwrap() {
-                WAVE_TYPE.store(440, core::sync::atomic::Ordering::Relaxed);
-            } else if key7.is_low().unwrap() {
-                WAVE_TYPE.store(494, core::sync::atomic::Ordering::Relaxed);
-            } else if key8.is_low().unwrap() {
-                WAVE_TYPE.store(523, core::sync::atomic::Ordering::Relaxed);
-            } else if key9.is_low().unwrap() {
-                WAVE_TYPE.store(587, core::sync::atomic::Ordering::Relaxed);
-            } else if key10.is_low().unwrap() {
-                WAVE_TYPE.store(659, core::sync::atomic::Ordering::Relaxed);
-            } else if key11.is_low().unwrap() {
-                WAVE_TYPE.store(699, core::sync::atomic::Ordering::Relaxed);
-            } else if key12.is_low().unwrap() {
-                WAVE_TYPE.store(784, core::sync::atomic::Ordering::Relaxed);
-            } else {
-                WAVE_TYPE.store(0, core::sync::atomic::Ordering::Relaxed);
+            pwm_transfer = done_transfer.read_next(buf);
+        };
+
+        if now > next_frame {
+            let dequeue = timer.get_counter();
+            // if button.is_low().unwrap() {
+            led_controller.next_frame(t);
+            t += (16.0 / 1000.0) * animation_speed;
+            while t > 1.0 {
+                t -= 1.0;
             }
+            // }
+            let led = timer.get_counter();
 
             let mut s: String<128> = String::new();
-            write!(
-                s,
-                "Frequency: {} Hz\nEncoder: {}",
-                WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
-                ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
-            )
-            .unwrap();
+            // write!(
+            //     s,
+            //     "Frequency: {} Hz\nEncoder: {}\ninput: {:032b}\nDQ: {}\nLED: {}\nScreen: {}",
+            //     WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
+            //     ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
+            //     input,
+            //     dequeue - now,
+            //     led - dequeue,
+            //     screen,
+            // )
+            // .unwrap();
+            write!(s, "Screen: {}", screen,).unwrap();
             screen_controller.write(&s).unwrap();
+            next_frame = now + 16u64.millis();
+
+            screen = timer.get_counter() - led;
         }
 
         // PWM will fire regularly, might as well sleep
-        wfe()
+        wfi()
     }
 }
 
@@ -259,118 +339,102 @@ where
 
         screen_controller.write(panic).unwrap();
         loop {
-            wfe();
+            wfi();
         }
     } else {
         display
     }
 }
 
-#[interrupt]
-fn PWM_IRQ_WRAP() {
-    static mut SYNTH: Option<Synth<Pwm0>> = None;
+/*
+ * # TODO
+ *
+ * - Feed pwm via DMA
+ * - Feed oled? and leds via DMA
+ * - Read encoder knob
+ * - Move synth code to fixed point arithmetic rather than float
+ * - Synth features
+ *   - Envelopes
+ *   - Filters
+ *   - Multiple oscillators
+ *   - Mix sources
+ *   - Amplitude modulation
+ *   - Frequency modulation
+ *   - Multiple channels
+ * - Nicer led visualization and key feedback
+ * - Mute speaker when not sounding
+ * - Basic sequencer
+ * - Edit sound parameters with GUI, encoder and buttons
+ */
 
-    if SYNTH.is_none() {
-        critical_section::with(|cs| {
-            *SYNTH = IRQ_SYNTH.borrow(cs).take();
-        });
-    }
+// #[interrupt]
+// fn IO_IRQ_BANK0() {
+//     static mut ENCODER_LAST: (bool, bool) = (false, false);
 
-    if let Some(synth) = SYNTH {
-        synth.next_sample(
-            WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
-            ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
-        );
-    }
+//     if let Some((enc_rot_a, enc_rot_b)) = ENCODER_PINS {
+//         let (a_last, b_last) = *ENCODER_LAST;
+//         let a_now = enc_rot_a.is_low().unwrap();
+//         let b_now = enc_rot_b.is_low().unwrap();
+//         let change = match (a_last, b_last, a_now, b_now) {
+//             (false, false, false, true)
+//             | (false, true, true, true)
+//             | (true, false, false, false)
+//             | (true, true, true, false) => 1,
+//             (false, false, true, false)
+//             | (false, true, false, false)
+//             | (true, false, true, true)
+//             | (true, true, false, true) => -1,
+//             _ => 0,
+//         };
+//         ENCODER_VALUE.add(change, core::sync::atomic::Ordering::SeqCst);
 
-    /*
-     * # TODO
-     *
-     * - Feed pwm via DMA
-     * - Feed oled? and leds via DMA
-     * - Read encoder knob
-     * - Move synth code to fixed point arithmetic rather than float
-     * - Synth features
-     *   - Envelopes
-     *   - Filters
-     *   - Multiple oscillators
-     *   - Mix sources
-     *   - Amplitude modulation
-     *   - Frequency modulation
-     *   - Multiple channels
-     * - Nicer led visualization and key feedback
-     * - Mute speaker when not sounding
-     * - Basic sequencer
-     * - Edit sound parameters with GUI, encoder and buttons
-     */
-}
+//         *ENCODER_LAST = (a_now, b_now);
 
-#[interrupt]
-fn IO_IRQ_BANK0() {
-    static mut ENCODER_PINS: Option<(EncoderRotAPin, EncoderRotBPin)> = None;
-    static mut ENCODER_LAST: (bool, bool) = (false, false);
-
-    if ENCODER_PINS.is_none() {
-        critical_section::with(|cs| {
-            *ENCODER_PINS = IRQ_ENCODER_PINS.borrow(cs).take();
-        });
-    }
-
-    if let Some((enc_rot_a, enc_rot_b)) = ENCODER_PINS {
-        let (a_last, b_last) = *ENCODER_LAST;
-        let a_now = enc_rot_a.is_low().unwrap();
-        let b_now = enc_rot_b.is_low().unwrap();
-        let change = match (a_last, b_last, a_now, b_now) {
-            (false, false, false, true)
-            | (false, true, true, true)
-            | (true, false, false, false)
-            | (true, true, true, false) => 1,
-            (false, false, true, false)
-            | (false, true, false, false)
-            | (true, false, true, true)
-            | (true, true, false, true) => -1,
-            _ => 0,
-        };
-        ENCODER_VALUE.add(change, core::sync::atomic::Ordering::SeqCst);
-
-        *ENCODER_LAST = (a_now, b_now);
-
-        enc_rot_a.clear_interrupt(Interrupt::EdgeHigh);
-        enc_rot_a.clear_interrupt(Interrupt::EdgeLow);
-        enc_rot_b.clear_interrupt(Interrupt::EdgeHigh);
-        enc_rot_b.clear_interrupt(Interrupt::EdgeLow);
-    }
-}
+//         enc_rot_a.clear_interrupt(Interrupt::EdgeHigh);
+//         enc_rot_a.clear_interrupt(Interrupt::EdgeLow);
+//         enc_rot_b.clear_interrupt(Interrupt::EdgeHigh);
+//         enc_rot_b.clear_interrupt(Interrupt::EdgeLow);
+//     }
+// }
 
 #[exception]
 fn SysTick() {
-    // Update buttons
+    static mut SYS_TICK_INPUT_PIN_GROUP: Option<InputPinGroup> = None;
+    if SYS_TICK_INPUT_PIN_GROUP.is_none() {
+        critical_section::with(|cs| {
+            *SYS_TICK_INPUT_PIN_GROUP = INPUT_PIN_GROUP.borrow(cs).take();
+        });
+    }
 
-    // Update encoder
-}
+    if let Some(input_pin_group) = SYS_TICK_INPUT_PIN_GROUP {
+        let input = input_pin_group.read();
 
-struct Buttons<const N: usize> {
-    button_pins: [Pin<DynPinId, FunctionSioOutput, PullUp>; N],
-}
-
-impl<const N: usize> Buttons<N> {
-    fn get_buttons(&self) -> [bool; N] {
-        todo!()
+        INPUT_QUEUE.enqueue(input).ok();
     }
 }
 
-struct Encoder {
-    pin_a: Pin<DynPinId, FunctionSioOutput, PullUp>,
-    pin_b: Pin<DynPinId, FunctionSioOutput, PullUp>,
-}
+// struct Buttons<const N: usize> {
+//     button_pins: [Pin<DynPinId, FunctionSioOutput, PullUp>; N],
+// }
 
-impl Encoder {
-    fn get_encoder(&self) -> EncoderValue {
-        todo!()
-    }
-}
-enum EncoderValue {
-    Clockwise,
-    Anticlockwise,
-    None,
-}
+// impl<const N: usize> Buttons<N> {
+//     fn get_buttons(&self) -> [bool; N] {
+//         todo!()
+//     }
+// }
+
+// struct Encoder {
+//     pin_a: Pin<DynPinId, FunctionSioOutput, PullUp>,
+//     pin_b: Pin<DynPinId, FunctionSioOutput, PullUp>,
+// }
+
+// impl Encoder {
+//     fn get_encoder(&self) -> EncoderValue {
+//         todo!()
+//     }
+// }
+// enum EncoderValue {
+//     Clockwise,
+//     Anticlockwise,
+//     None,
+// }

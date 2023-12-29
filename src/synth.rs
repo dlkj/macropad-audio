@@ -1,36 +1,29 @@
-use adafruit_macropad as bsp;
-use bsp::hal::pwm::{FreeRunning, Slice, SliceId};
-use embedded_hal::PwmPin;
 use num_traits::clamp;
 
-pub(crate) struct Synth<S: SliceId> {
-    pwm: Slice<S, FreeRunning>,
+pub(crate) struct Synth {
     phase: f32,    // 0 to 128
     duration: u32, // in samples
 }
 
-impl<S: SliceId> Synth<S> {
+impl Synth {
     const PWM_MAX: u16 = 4096;
 
-    pub fn new(pwm: Slice<S, FreeRunning>) -> Self {
+    pub fn new() -> Self {
         Self {
-            pwm,
             phase: 0.0,
             duration: 0,
         }
     }
 
-    pub fn next_sample(&mut self, wave_type: u16, attack: i32) {
-        self.pwm.clear_interrupt();
-
+    pub fn next_sample(&mut self, wave_type: u16, attack: i32) -> u16 {
         match wave_type {
             0 => {
-                self.pwm.channel_a.set_duty(Self::PWM_MAX / 2);
                 self.duration = 0;
+                Self::PWM_MAX / 2
             }
             _ => {
                 self.phase += 128.0 / 22190.0 * wave_type as f32;
-                while self.phase > 128.0 {
+                while self.phase as usize >= 128 {
                     self.phase -= 128.0;
                 }
                 if self.phase < 0.0 {
@@ -42,8 +35,8 @@ impl<S: SliceId> Synth<S> {
                     * Self::envelope(true, self.duration, clamp(attack, 0, 1024) as u32))
                     as i16;
                 let scaled = (i32::from(clamp(scaled, -2047, 2047)) + 2047) as u16;
-                self.pwm.channel_a.set_duty(scaled);
                 self.duration += 1;
+                scaled
             }
         }
     }

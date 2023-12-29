@@ -17,10 +17,14 @@ embedded-text = "0.7"
 ws2812-pio = "0.7.0"
 smart-leds = "0.3.0"
 sh1106 = "0.5.0"
-heapless = "0.8"
+heapless = { version = "0.8", features = ["portable-atomic"] }
 micromath = "2.1"
-portable-atomic = { version = "1.6", features = ["critical-section"] }
+portable-atomic = { version = "1.6", features = [
+    "require-cas",
+    "critical-section",
+] }
 panic-persist = { version = "0.3", features = ["utf8"] }
+frunk_core = { version = "0.4.2", default-features = false }
 
 # cargo build/run
 [profile.dev]
