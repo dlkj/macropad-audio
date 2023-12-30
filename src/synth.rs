@@ -1,3 +1,7 @@
+use fixed::{
+    traits::LosslessTryFrom,
+    types::{I16F16, U16F16},
+};
 use num_traits::clamp;
 
 pub(crate) struct Synth {
@@ -28,34 +32,30 @@ impl Synth {
                 }
                 if self.phase < 0.0 {
                     self.phase = 0.0;
-                }
+                };
 
-                let scaled = ((SIN_12BIT_128[self.phase as usize]
-                    + SIN_12BIT_128[(self.phase as usize + 12) / 2])
-                    as f32
-                    * Self::envelope(
-                        true,
-                        self.duration,
-                        attack.into(),
-                        decay.into(),
-                        sustain as f32 / 100.0,
-                    )) as i16;
-                let scaled = (i32::from(clamp(scaled, -2047, 2047)) + 2047) as u16;
+                let envelope = Self::envelope(true, self.duration as u16, attack, decay, sustain);
+
+                let scaled = I16F16::from(SIN_12BIT_128[self.phase as usize])
+                    * I16F16::lossless_try_from(envelope).unwrap();
+
+                let scaled = (clamp(scaled.to_num::<i32>(), -2047, 2047) + 2047) as u16;
                 self.duration += 1;
                 scaled
             }
         }
     }
 
-    fn envelope(_key_down: bool, duration: u32, attack: u32, decay: u32, sustain: f32) -> f32 {
+    fn envelope(_key_down: bool, duration: u16, attack: u16, decay: u16, sustain: u8) -> U16F16 {
         let attack = attack * 22;
         let decay = decay * 22;
-        let sustain = clamp(sustain, 0.0, 1.0);
+        let sustain = U16F16::from(clamp(sustain, 0, 100)) / 100;
 
         if (0..attack).contains(&duration) {
-            (duration as f32) / attack as f32
+            (U16F16::from_num(duration) / U16F16::from_num(attack)).lerp(U16F16::ZERO, U16F16::ONE)
         } else if (attack..(attack + decay)).contains(&duration) {
-            ((duration - attack) as f32 / decay as f32) * (1.0 - sustain) + sustain
+            (U16F16::from_num(duration - attack) / U16F16::from_num(decay))
+                .lerp(U16F16::ONE, sustain)
         } else {
             sustain
         }

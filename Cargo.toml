@@ -25,6 +25,7 @@ portable-atomic = { version = "1.6", features = [
 ] }
 panic-persist = { version = "0.3", features = ["utf8"] }
 frunk_core = { version = "0.4.2", default-features = false }
+fixed = "1.24"
 
 # cargo build/run
 [profile.dev]
