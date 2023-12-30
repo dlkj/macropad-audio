@@ -7,7 +7,7 @@ use bsp::{
     hal::{
         self,
         clocks::{init_clocks_and_plls, Clock},
-        dma::{double_buffer, DMAExt},
+        dma::{double_buffer, DMAExt, SingleChannel},
         fugit::{ExtU64, MicrosDurationU64},
         gpio::{
             bank0::{
@@ -25,9 +25,10 @@ use bsp::{
         watchdog::Watchdog,
         Timer,
     },
+    pac::interrupt,
 };
 use core::{
-    cell::Cell,
+    cell::RefCell,
     fmt::{Debug, Write},
 };
 use cortex_m::{
@@ -41,10 +42,10 @@ use display::Screen;
 use embedded_hal::digital::v2::OutputPin;
 use frunk_core::hlist::{HCons, HNil};
 use hal::fugit::RateExtU32;
-use heapless::{mpmc::Q64, String};
+use heapless::{spsc::Queue, String};
 use leds::LedController;
 use panic_persist as _;
-use portable_atomic::{AtomicI32, AtomicU16};
+use portable_atomic::{AtomicU16, AtomicU32, Ordering};
 use sh1106::{interface::DisplayInterface, mode::GraphicsMode, Builder};
 use synth::Synth;
 use ws2812_pio::Ws2812;
@@ -110,13 +111,47 @@ type InputPinGroup = PinGroup<
     >,
 >;
 
-static WAVE_TYPE: AtomicU16 = AtomicU16::new(0);
-static ENCODER_VALUE: AtomicI32 = AtomicI32::new(0);
-static INPUT_PIN_GROUP: Mutex<Cell<Option<InputPinGroup>>> = Mutex::new(Cell::new(None));
+const PWM_SAMPLE_LEN: usize = 220;
 
-static INPUT_QUEUE: Q64<u32> = Q64::new();
+type PwmDmaTransfer = double_buffer::Transfer<
+    hal::dma::Channel<hal::dma::CH0>,
+    hal::dma::Channel<hal::dma::CH1>,
+    &'static mut [CcFormat; PWM_SAMPLE_LEN],
+    hal::pwm::SliceDmaWriteCc<hal::pwm::Pwm0, hal::pwm::FreeRunning>,
+    double_buffer::ReadNext<&'static mut [CcFormat; PWM_SAMPLE_LEN]>,
+>;
+
+static SHARED_STATE: Mutex<RefCell<Option<SharedState>>> = Mutex::new(RefCell::new(None));
+static ATOMIC_STATE: AtomicState = AtomicState::new();
 
 const PWM_MAX: u16 = 4096;
+
+struct SharedState {
+    input_pin_group: Option<InputPinGroup>,
+    pwm_dma_transfer: Option<PwmDmaTransfer>,
+}
+
+impl SharedState {
+    fn new(input_pin_group: InputPinGroup, pwm_dma_transfer: PwmDmaTransfer) -> Self {
+        Self {
+            input_pin_group: Some(input_pin_group),
+            pwm_dma_transfer: Some(pwm_dma_transfer),
+        }
+    }
+}
+struct AtomicState {
+    input_values: AtomicU32,
+    wave_type: AtomicU16,
+}
+
+impl AtomicState {
+    pub const fn new() -> Self {
+        Self {
+            input_values: AtomicU32::new(u32::MAX),
+            wave_type: AtomicU16::new(0),
+        }
+    }
+}
 
 #[entry]
 fn main() -> ! {
@@ -125,7 +160,8 @@ fn main() -> ! {
     let sio = Sio::new(pac.SIO);
     let mut core = pac::CorePeripherals::take().unwrap();
     core.SYST.set_clock_source(SystClkSource::Core);
-    core.SYST.set_reload(SYST::get_ticks_per_10ms());
+    let get_ticks_per_1ms = (SYST::get_ticks_per_10ms() + 1) - 1;
+    core.SYST.set_reload(get_ticks_per_1ms);
     core.SYST.clear_current();
     core.SYST.enable_counter();
 
@@ -199,14 +235,14 @@ fn main() -> ! {
     pwm.set_div_frac(PWM_DIV_FRAC);
     pwm.enable();
 
-    let buf = singleton!(: [CcFormat; 220] = [CcFormat{a: PWM_MAX/2, b: PWM_MAX/2}; 220]).unwrap();
-    let buf2 = singleton!(: [CcFormat; 220] = [CcFormat{a: PWM_MAX/2, b: PWM_MAX/2}; 220]).unwrap();
+    let pwm_buf0 = singleton!(: [CcFormat; PWM_SAMPLE_LEN] = [CcFormat{a: PWM_MAX/2, b: PWM_MAX/2}; PWM_SAMPLE_LEN]).unwrap();
+    let pwm_buf1 = singleton!(: [CcFormat; PWM_SAMPLE_LEN] = [CcFormat{a: PWM_MAX/2, b: PWM_MAX/2}; PWM_SAMPLE_LEN]).unwrap();
 
-    let dma = pac.DMA.split(&mut pac.RESETS);
-
+    let mut dma = pac.DMA.split(&mut pac.RESETS);
     let dma_pwm = SliceDmaWrite::from(pwm);
-
-    let dma_pwm_conf = double_buffer::Config::new((dma.ch0, dma.ch1), buf, dma_pwm.cc);
+    dma.ch0.enable_irq0();
+    dma.ch1.enable_irq0();
+    let dma_pwm_conf = double_buffer::Config::new((dma.ch0, dma.ch1), pwm_buf0, dma_pwm.cc);
 
     pins.speaker_shutdown
         .into_push_pull_output()
@@ -231,96 +267,55 @@ fn main() -> ! {
     let input_pins = input_pins.add_pin(pins.button.into_pull_up_input());
     let input_pins = input_pins.add_pin(pins.encoder_rota.into_pull_up_input());
     let input_pins = input_pins.add_pin(pins.encoder_rotb.into_pull_up_input());
-    critical_section::with(|cs| {
-        INPUT_PIN_GROUP.borrow(cs).set(Some(input_pins));
-    });
 
     let mut screen_controller = Screen::new(display).unwrap();
     let mut led_controller = LedController::new(ws, sin);
 
+    // Start DMA
+    let pwm_transfer = dma_pwm_conf.start().read_next(pwm_buf1);
+
+    // Set shared state
+    let shared_state = SharedState::new(input_pins, pwm_transfer);
+    critical_section::with(|cs| {
+        *SHARED_STATE.borrow(cs).borrow_mut() = Some(shared_state);
+    });
     // Enable interrupts
+    unsafe {
+        pac::NVIC::unmask(pac::Interrupt::DMA_IRQ_0);
+    }
+
     core.SYST.enable_interrupt();
 
-    // Start DMA
-    let mut pwm_transfer = dma_pwm_conf.start().read_next(buf2);
-    // Slow down timer by this factor (0.1 will result in 10 seconds):
     let animation_speed = 0.1;
     let mut t = 0.0;
 
     let mut next_frame = Instant::from_ticks(0);
 
-    let mut input = 0;
     let mut screen = MicrosDurationU64::from_ticks(0);
-    let mut synth = Synth::new();
+
     loop {
         let now = timer.get_counter();
-        while let Some(next_input) = INPUT_QUEUE.dequeue() {
-            input = next_input;
-        }
-
-        if pwm_transfer.is_done() {
-            WAVE_TYPE.store(
-                match input {
-                    i if (i >> 1 & 1) == 0 => 262,
-                    i if (i >> 2 & 1) == 0 => 294,
-                    i if (i >> 3 & 1) == 0 => 330,
-                    i if (i >> 4 & 1) == 0 => 349,
-                    i if (i >> 5 & 1) == 0 => 392,
-                    i if (i >> 6 & 1) == 0 => 440,
-                    i if (i >> 7 & 1) == 0 => 494,
-                    i if (i >> 8 & 1) == 0 => 523,
-                    i if (i >> 9 & 1) == 0 => 587,
-                    i if (i >> 10 & 1) == 0 => 659,
-                    i if (i >> 11 & 1) == 0 => 699,
-                    i if (i >> 12 & 1) == 0 => 784,
-                    _ => 0,
-                },
-                core::sync::atomic::Ordering::Relaxed,
-            );
-
-            let (buf, done_transfer) = pwm_transfer.wait();
-
-            for s in buf.iter_mut() {
-                s.a = synth.next_sample(
-                    WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
-                    ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
-                )
-            }
-
-            pwm_transfer = done_transfer.read_next(buf);
-        };
+        let input = ATOMIC_STATE
+            .input_values
+            .load(portable_atomic::Ordering::Relaxed);
 
         if now > next_frame {
-            let dequeue = timer.get_counter();
-            // if button.is_low().unwrap() {
             led_controller.next_frame(t);
             t += (16.0 / 1000.0) * animation_speed;
             while t > 1.0 {
                 t -= 1.0;
             }
-            // }
             let led = timer.get_counter();
 
             let mut s: String<128> = String::new();
-            // write!(
-            //     s,
-            //     "Frequency: {} Hz\nEncoder: {}\ninput: {:032b}\nDQ: {}\nLED: {}\nScreen: {}",
-            //     WAVE_TYPE.load(core::sync::atomic::Ordering::Relaxed),
-            //     ENCODER_VALUE.load(core::sync::atomic::Ordering::Relaxed),
-            //     input,
-            //     dequeue - now,
-            //     led - dequeue,
-            //     screen,
-            // )
-            // .unwrap();
-            write!(s, "Screen: {}", screen,).unwrap();
+            write!(s, "Input: {:019b}\nScreen: {}", input, screen,).unwrap();
             screen_controller.write(&s).unwrap();
             next_frame = now + 16u64.millis();
 
             screen = timer.get_counter() - led;
         }
 
-        // PWM will fire regularly, might as well sleep
+        // wait for the next timer tick
         wfi()
     }
 }
@@ -349,7 +344,6 @@ where
 /*
  * # TODO
  *
- * - Feed pwm via DMA
  * - Feed oled? and leds via DMA
  * - Read encoder knob
  * - Move synth code to fixed point arithmetic rather than float
@@ -365,6 +359,7 @@ where
  * - Mute speaker when not sounding
  * - Basic sequencer
  * - Edit sound parameters with GUI, encoder and buttons
+ * - Move synth to 2nd core?
  */
 
 // #[interrupt]
@@ -399,42 +394,75 @@ where
 
 #[exception]
 fn SysTick() {
-    static mut SYS_TICK_INPUT_PIN_GROUP: Option<InputPinGroup> = None;
-    if SYS_TICK_INPUT_PIN_GROUP.is_none() {
+    static mut INPUT_PIN_GROUP: Option<InputPinGroup> = None;
+    static mut INPUT_HISTORY: Queue<u32, 8> = Queue::new();
+
+    if INPUT_PIN_GROUP.is_none() {
         critical_section::with(|cs| {
-            *SYS_TICK_INPUT_PIN_GROUP = INPUT_PIN_GROUP.borrow(cs).take();
+            *INPUT_PIN_GROUP = SHARED_STATE
+                .borrow(cs)
+                .borrow_mut()
+                .as_mut()
+                .map(|s| s.input_pin_group.take())
+                .unwrap_or_default();
         });
     }
 
-    if let Some(input_pin_group) = SYS_TICK_INPUT_PIN_GROUP {
+    if let Some(input_pin_group) = INPUT_PIN_GROUP {
         let input = input_pin_group.read();
+        while INPUT_HISTORY.is_full() {
+            INPUT_HISTORY.dequeue();
+        }
+        INPUT_HISTORY.enqueue(input).unwrap();
 
-        INPUT_QUEUE.enqueue(input).ok();
+        ATOMIC_STATE.input_values.store(
+            INPUT_HISTORY.iter().fold(u32::MAX, |a, &i| a & i),
+            Ordering::Relaxed,
+        );
     }
 }
 
-// struct Buttons<const N: usize> {
-//     button_pins: [Pin<DynPinId, FunctionSioOutput, PullUp>; N],
-// }
+#[interrupt]
+fn DMA_IRQ_0() {
+    static mut PWM_DMA_TRANSFER: Option<PwmDmaTransfer> = None;
+    static mut SYNTH: Synth = Synth::new();
 
-// impl<const N: usize> Buttons<N> {
-//     fn get_buttons(&self) -> [bool; N] {
-//         todo!()
-//     }
-// }
+    if PWM_DMA_TRANSFER.is_none() {
+        *PWM_DMA_TRANSFER = critical_section::with(|cs| {
+            SHARED_STATE
+                .borrow(cs)
+                .borrow_mut()
+                .as_mut()
+                .map(|s| s.pwm_dma_transfer.take())
+                .unwrap_or_default()
+        });
+    }
 
-// struct Encoder {
-//     pin_a: Pin<DynPinId, FunctionSioOutput, PullUp>,
-//     pin_b: Pin<DynPinId, FunctionSioOutput, PullUp>,
-// }
+    if let Some(mut transfer) = PWM_DMA_TRANSFER.take() {
+        transfer.check_irq0();
+        let (buf, transfer) = transfer.wait();
+        let input = ATOMIC_STATE.input_values.load(Ordering::Relaxed);
+        let wave_type = match input {
+            i if (i >> 1 & 1) == 0 => 262,
+            i if (i >> 2 & 1) == 0 => 294,
+            i if (i >> 3 & 1) == 0 => 330,
+            i if (i >> 4 & 1) == 0 => 349,
+            i if (i >> 5 & 1) == 0 => 392,
+            i if (i >> 6 & 1) == 0 => 440,
+            i if (i >> 7 & 1) == 0 => 494,
+            i if (i >> 8 & 1) == 0 => 523,
+            i if (i >> 9 & 1) == 0 => 587,
+            i if (i >> 10 & 1) == 0 => 659,
+            i if (i >> 11 & 1) == 0 => 699,
+            i if (i >> 12 & 1) == 0 => 784,
+            _ => 0,
+        };
 
-// impl Encoder {
-//     fn get_encoder(&self) -> EncoderValue {
-//         todo!()
-//     }
-// }
-// enum EncoderValue {
-//     Clockwise,
-//     Anticlockwise,
-//     None,
-// }
+        for s in buf.iter_mut() {
+            s.a = SYNTH.next_sample(wave_type, 0)
+        }
+
+        ATOMIC_STATE.wave_type.store(wave_type, Ordering::Relaxed);
+        *PWM_DMA_TRANSFER = Some(transfer.read_next(buf));
+    }
+}

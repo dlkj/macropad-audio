@@ -8,7 +8,7 @@ pub(crate) struct Synth {
 impl Synth {
     const PWM_MAX: u16 = 4096;
 
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             phase: 0.0,
             duration: 0,
@@ -31,7 +31,8 @@ impl Synth {
                 }
 
                 let scaled = ((SIN_12BIT_128[self.phase as usize]
-                    + SIN_12BIT_128[self.phase as usize / 2]) as f32
+                    + SIN_12BIT_128[(self.phase as usize + 12) / 2])
+                    as f32
                     * Self::envelope(true, self.duration, clamp(attack, 0, 1024) as u32))
                     as i16;
                 let scaled = (i32::from(clamp(scaled, -2047, 2047)) + 2047) as u16;
@@ -41,11 +42,11 @@ impl Synth {
         }
     }
 
-    fn envelope(key_down: bool, duration: u32, attack: u32) -> f32 {
-        const ATTACK: u32 = 1000 * 22;
-        const DECAY: u32 = 400 * 22;
-        const SUSTAIN: f32 = 0.5;
-        const RELEASE: u32 = 200;
+    fn envelope(_key_down: bool, duration: u32, attack: u32) -> f32 {
+        // const ATTACK: u32 = 1000 * 22;
+        // const DECAY: u32 = 400 * 22;
+        // const SUSTAIN: f32 = 0.5;
+        // const RELEASE: u32 = 200;
 
         if (0..(attack * 22)).contains(&duration) {
             (duration as f32) / (attack * 22) as f32
