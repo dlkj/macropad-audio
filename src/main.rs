@@ -1,6 +1,26 @@
 #![no_std]
 #![no_main]
 
+/*
+ * # TODO
+ *
+ * - Feed oled? and leds via DMA
+ * - Move synth code to fixed point arithmetic rather than float
+ * - Synth features
+ *   - Envelopes
+ *   - Filters
+ *   - Multiple oscillators
+ *   - Mix sources
+ *   - Amplitude modulation
+ *   - Frequency modulation
+ *   - Multiple channels
+ * - Nicer led visualization and key feedback
+ * - Mute speaker when not sounding
+ * - Basic sequencer
+ * - Edit sound parameters with GUI, encoder and buttons
+ * - Use 2nd core
+ */
+
 use adafruit_macropad as bsp;
 use bsp::{
     entry,
@@ -45,7 +65,7 @@ use hal::fugit::RateExtU32;
 use heapless::{spsc::Queue, String};
 use leds::LedController;
 use panic_persist as _;
-use portable_atomic::{AtomicU16, AtomicU32, Ordering};
+use portable_atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering};
 use sh1106::{interface::DisplayInterface, mode::GraphicsMode, Builder};
 use synth::Synth;
 use ws2812_pio::Ws2812;
@@ -142,6 +162,7 @@ impl SharedState {
 struct AtomicState {
     input_values: AtomicU32,
     wave_type: AtomicU16,
+    encoder_value: AtomicI32,
 }
 
 impl AtomicState {
@@ -149,6 +170,7 @@ impl AtomicState {
         Self {
             input_values: AtomicU32::new(u32::MAX),
             wave_type: AtomicU16::new(0),
+            encoder_value: AtomicI32::new(0),
         }
     }
 }
@@ -308,7 +330,14 @@ fn main() -> ! {
             let led = timer.get_counter();
 
             let mut s: String<128> = String::new();
-            write!(s, "Input: {:019b}\nScreen: {}", input, screen,).unwrap();
+            write!(
+                s,
+                "Input: {:019b}\nScreen: {}\nEncoder: {}",
+                input,
+                screen,
+                ATOMIC_STATE.encoder_value.load(Ordering::Relaxed)
+            )
+            .unwrap();
             screen_controller.write(&s).unwrap();
             next_frame = now + 16u64.millis();
 
@@ -341,61 +370,12 @@ where
     }
 }
 
-/*
- * # TODO
- *
- * - Feed oled? and leds via DMA
- * - Read encoder knob
- * - Move synth code to fixed point arithmetic rather than float
- * - Synth features
- *   - Envelopes
- *   - Filters
- *   - Multiple oscillators
- *   - Mix sources
- *   - Amplitude modulation
- *   - Frequency modulation
- *   - Multiple channels
- * - Nicer led visualization and key feedback
- * - Mute speaker when not sounding
- * - Basic sequencer
- * - Edit sound parameters with GUI, encoder and buttons
- * - Move synth to 2nd core?
- */
-
-// #[interrupt]
-// fn IO_IRQ_BANK0() {
-//     static mut ENCODER_LAST: (bool, bool) = (false, false);
-
-//     if let Some((enc_rot_a, enc_rot_b)) = ENCODER_PINS {
-//         let (a_last, b_last) = *ENCODER_LAST;
-//         let a_now = enc_rot_a.is_low().unwrap();
-//         let b_now = enc_rot_b.is_low().unwrap();
-//         let change = match (a_last, b_last, a_now, b_now) {
-//             (false, false, false, true)
-//             | (false, true, true, true)
-//             | (true, false, false, false)
-//             | (true, true, true, false) => 1,
-//             (false, false, true, false)
-//             | (false, true, false, false)
-//             | (true, false, true, true)
-//             | (true, true, false, true) => -1,
-//             _ => 0,
-//         };
-//         ENCODER_VALUE.add(change, core::sync::atomic::Ordering::SeqCst);
-
-//         *ENCODER_LAST = (a_now, b_now);
-
-//         enc_rot_a.clear_interrupt(Interrupt::EdgeHigh);
-//         enc_rot_a.clear_interrupt(Interrupt::EdgeLow);
-//         enc_rot_b.clear_interrupt(Interrupt::EdgeHigh);
-//         enc_rot_b.clear_interrupt(Interrupt::EdgeLow);
-//     }
-// }
-
 #[exception]
 fn SysTick() {
     static mut INPUT_PIN_GROUP: Option<InputPinGroup> = None;
     static mut INPUT_HISTORY: Queue<u32, 8> = Queue::new();
+    static mut ENCODER_LAST: u8 = 0b11;
+    static mut ENCODER_STEP: i8 = 0;
 
     if INPUT_PIN_GROUP.is_none() {
         critical_section::with(|cs| {
@@ -410,6 +390,8 @@ fn SysTick() {
 
     if let Some(input_pin_group) = INPUT_PIN_GROUP {
         let input = input_pin_group.read();
+
+        // debounce pins
         while INPUT_HISTORY.is_full() {
             INPUT_HISTORY.dequeue();
         }
@@ -419,6 +401,25 @@ fn SysTick() {
             INPUT_HISTORY.iter().fold(u32::MAX, |a, &i| a & i),
             Ordering::Relaxed,
         );
+
+        // track the rotary encoder
+        let encoder_now = ((input >> 17) & 0b11) as u8;
+        *ENCODER_STEP += match (*ENCODER_LAST, encoder_now) {
+            (0b00, 0b01) | (0b01, 0b11) | (0b10, 0b00) | (0b11, 0b10) => 1,
+            (0b00, 0b10) | (0b01, 0b00) | (0b10, 0b11) | (0b11, 0b01) => -1,
+            _ => 0,
+        };
+        *ENCODER_LAST = encoder_now;
+
+        // 0b11 is the detent value of the encoder
+        if encoder_now == 0b11 {
+            match *ENCODER_STEP {
+                ..=-1 => ATOMIC_STATE.encoder_value.add(1, Ordering::Relaxed),
+                0 => (),
+                1.. => ATOMIC_STATE.encoder_value.sub(1, Ordering::Relaxed),
+            }
+            *ENCODER_STEP = 0
+        }
     }
 }
 
