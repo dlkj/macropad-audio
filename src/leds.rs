@@ -27,19 +27,23 @@ where
         }
     }
 
-    pub fn next_frame(&mut self, t: f32) {
+    pub fn next_frame(&mut self, t: f32, input: u32) {
         for (i, led) in self.leds.iter_mut().enumerate() {
-            let hue_offs = i as f32 * 0.0208333;
+            let rgb = if (input >> i) & 0b1 == 0 {
+                Self::hsv2rgb_u8(0.0, 0.0, 1.0)
+            } else {
+                let hue_offs = i as f32 * 0.0208333;
 
-            let sin_11 = (self.sin)((t + hue_offs) * 2.0 * core::f32::consts::PI);
-            // Bring -1..1 sine range to 0..1 range:
-            let sin_01 = (sin_11 + 1.0) * 0.5;
+                let sin_11 = (self.sin)((t + hue_offs) * 2.0 * core::f32::consts::PI);
+                // Bring -1..1 sine range to 0..1 range:
+                let sin_01 = (sin_11 + 1.0) * 0.5;
 
-            let hue = 360.0 * sin_01;
-            let sat = 1.0;
-            let val = 1.0;
+                let hue = 360.0 * sin_01;
+                let sat = 1.0;
+                let val = 1.0;
 
-            let rgb = Self::hsv2rgb_u8(hue, sat, val);
+                Self::hsv2rgb_u8(hue, sat, val)
+            };
             *led = rgb.into();
         }
 

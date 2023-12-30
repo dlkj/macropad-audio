@@ -15,7 +15,7 @@ impl Synth {
         }
     }
 
-    pub fn next_sample(&mut self, wave_type: u16, attack: i32) -> u16 {
+    pub fn next_sample(&mut self, wave_type: u16, attack: u16, decay: u16, sustain: u8) -> u16 {
         match wave_type {
             0 => {
                 self.duration = 0;
@@ -33,8 +33,13 @@ impl Synth {
                 let scaled = ((SIN_12BIT_128[self.phase as usize]
                     + SIN_12BIT_128[(self.phase as usize + 12) / 2])
                     as f32
-                    * Self::envelope(true, self.duration, clamp(attack, 0, 1024) as u32))
-                    as i16;
+                    * Self::envelope(
+                        true,
+                        self.duration,
+                        attack.into(),
+                        decay.into(),
+                        sustain as f32 / 100.0,
+                    )) as i16;
                 let scaled = (i32::from(clamp(scaled, -2047, 2047)) + 2047) as u16;
                 self.duration += 1;
                 scaled
@@ -42,16 +47,17 @@ impl Synth {
         }
     }
 
-    fn envelope(_key_down: bool, duration: u32, attack: u32) -> f32 {
-        // const ATTACK: u32 = 1000 * 22;
-        // const DECAY: u32 = 400 * 22;
-        // const SUSTAIN: f32 = 0.5;
-        // const RELEASE: u32 = 200;
+    fn envelope(_key_down: bool, duration: u32, attack: u32, decay: u32, sustain: f32) -> f32 {
+        let attack = attack * 22;
+        let decay = decay * 22;
+        let sustain = clamp(sustain, 0.0, 1.0);
 
-        if (0..(attack * 22)).contains(&duration) {
-            (duration as f32) / (attack * 22) as f32
+        if (0..attack).contains(&duration) {
+            (duration as f32) / attack as f32
+        } else if (attack..(attack + decay)).contains(&duration) {
+            ((duration - attack) as f32 / decay as f32) * (1.0 - sustain) + sustain
         } else {
-            1.0
+            sustain
         }
     }
 }

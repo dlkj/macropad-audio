@@ -14,7 +14,7 @@
  *   - Amplitude modulation
  *   - Frequency modulation
  *   - Multiple channels
- * - Nicer led visualization and key feedback
+ * - Nicer led visualizations
  * - Mute speaker when not sounding
  * - Basic sequencer
  * - Edit sound parameters with GUI, encoder and buttons
@@ -64,8 +64,9 @@ use frunk_core::hlist::{HCons, HNil};
 use hal::fugit::RateExtU32;
 use heapless::{spsc::Queue, String};
 use leds::LedController;
+use num_traits::clamp;
 use panic_persist as _;
-use portable_atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering};
+use portable_atomic::{AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use sh1106::{interface::DisplayInterface, mode::GraphicsMode, Builder};
 use synth::Synth;
 use ws2812_pio::Ws2812;
@@ -163,6 +164,10 @@ struct AtomicState {
     input_values: AtomicU32,
     wave_type: AtomicU16,
     encoder_value: AtomicI32,
+    attack: AtomicU16,
+    decay: AtomicU16,
+    sustain: AtomicU8,
+    release: AtomicU16,
 }
 
 impl AtomicState {
@@ -171,8 +176,19 @@ impl AtomicState {
             input_values: AtomicU32::new(u32::MAX),
             wave_type: AtomicU16::new(0),
             encoder_value: AtomicI32::new(0),
+            attack: AtomicU16::new(0),
+            decay: AtomicU16::new(0),
+            sustain: AtomicU8::new(100),
+            release: AtomicU16::new(0),
         }
     }
+}
+
+enum EnvelopeField {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
 }
 
 #[entry]
@@ -312,17 +328,67 @@ fn main() -> ! {
     let mut t = 0.0;
 
     let mut next_frame = Instant::from_ticks(0);
-
     let mut screen = MicrosDurationU64::from_ticks(0);
+
+    let mut last_encoder_raw_value = 0;
+    let mut last_input = u32::MAX;
+    let mut envelope_field = EnvelopeField::Attack;
 
     loop {
         let now = timer.get_counter();
-        let input = ATOMIC_STATE
-            .input_values
-            .load(portable_atomic::Ordering::Relaxed);
-
         if now > next_frame {
-            led_controller.next_frame(t);
+            let input = ATOMIC_STATE
+                .input_values
+                .load(portable_atomic::Ordering::Relaxed);
+
+            let encoder_raw_value = ATOMIC_STATE.encoder_value.load(Ordering::Relaxed);
+            let encoder_change = encoder_raw_value - last_encoder_raw_value;
+
+            if input & 0b1 == 1 && last_input & 0b1 == 0 {
+                envelope_field = match envelope_field {
+                    EnvelopeField::Attack => EnvelopeField::Decay,
+                    EnvelopeField::Decay => EnvelopeField::Sustain,
+                    EnvelopeField::Sustain => EnvelopeField::Release,
+                    EnvelopeField::Release => EnvelopeField::Attack,
+                };
+            }
+
+            match envelope_field {
+                EnvelopeField::Attack => {
+                    ATOMIC_STATE
+                        .attack
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
+                            Some(clamp(a as i32 + encoder_change * 10, 0, 999) as u16)
+                        })
+                        .unwrap();
+                }
+                EnvelopeField::Decay => {
+                    ATOMIC_STATE
+                        .decay
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
+                            Some(clamp(a as i32 + encoder_change * 10, 0, 999) as u16)
+                        })
+                        .unwrap();
+                }
+                EnvelopeField::Sustain => {
+                    ATOMIC_STATE
+                        .sustain
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
+                            Some(clamp(a as i32 + encoder_change * 5, 0, 100) as u8)
+                        })
+                        .unwrap();
+                }
+                EnvelopeField::Release => {
+                    ATOMIC_STATE
+                        .release
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
+                            Some(clamp(a as i32 + encoder_change * 10, 0, 999) as u16)
+                        })
+                        .unwrap();
+                }
+            };
+
+            led_controller.next_frame(t, input >> 1);
             t += (16.0 / 1000.0) * animation_speed;
             while t > 1.0 {
                 t -= 1.0;
@@ -332,16 +398,26 @@ fn main() -> ! {
             let mut s: String<128> = String::new();
             write!(
                 s,
-                "Input: {:019b}\nScreen: {}\nEncoder: {}",
-                input,
-                screen,
-                ATOMIC_STATE.encoder_value.load(Ordering::Relaxed)
+                "A: {:03} D: {:03} S: {:03} R: {:03}\n{}\n\n\n\nScreen: {}",
+                ATOMIC_STATE.attack.load(Ordering::Relaxed),
+                ATOMIC_STATE.decay.load(Ordering::Relaxed),
+                ATOMIC_STATE.sustain.load(Ordering::Relaxed),
+                ATOMIC_STATE.release.load(Ordering::Relaxed),
+                match envelope_field {
+                    EnvelopeField::Attack => "Attack",
+                    EnvelopeField::Decay => "Decay",
+                    EnvelopeField::Sustain => "Sustain",
+                    EnvelopeField::Release => "Release",
+                },
+                screen
             )
             .unwrap();
             screen_controller.write(&s).unwrap();
             next_frame = now + 16u64.millis();
 
             screen = timer.get_counter() - led;
+            last_encoder_raw_value = encoder_raw_value;
+            last_input = input;
         }
 
         // wait for the next timer tick
@@ -460,7 +536,12 @@ fn DMA_IRQ_0() {
         };
 
         for s in buf.iter_mut() {
-            s.a = SYNTH.next_sample(wave_type, 0)
+            s.a = SYNTH.next_sample(
+                wave_type,
+                ATOMIC_STATE.attack.load(Ordering::Relaxed),
+                ATOMIC_STATE.decay.load(Ordering::Relaxed),
+                ATOMIC_STATE.sustain.load(Ordering::Relaxed),
+            )
         }
 
         ATOMIC_STATE.wave_type.store(wave_type, Ordering::Relaxed);
