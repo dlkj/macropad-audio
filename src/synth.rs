@@ -1,11 +1,18 @@
 use fixed::{
-    traits::LosslessTryFrom,
+    traits::{LosslessTryFrom, LossyFrom},
     types::{I16F16, U16F16},
 };
 use num_traits::clamp;
 
+#[derive(Clone, Copy)]
+enum Event {
+    KeyUp(u16),
+    KeyDown(u16),
+}
+
 pub(crate) struct Synth {
-    phase: f32,    // 0 to 128
+    phase: U16F16, // 0 to 128
+    event: Event,
     duration: u32, // in samples
 }
 
@@ -14,50 +21,91 @@ impl Synth {
 
     pub const fn new() -> Self {
         Self {
-            phase: 0.0,
+            phase: U16F16::ZERO,
             duration: 0,
+            event: Event::KeyUp(0),
         }
     }
 
-    pub fn next_sample(&mut self, wave_type: u16, attack: u16, decay: u16, sustain: u8) -> u16 {
-        match wave_type {
-            0 => {
-                self.duration = 0;
-                Self::PWM_MAX / 2
-            }
-            _ => {
-                self.phase += 128.0 / 22190.0 * wave_type as f32;
-                while self.phase as usize >= 128 {
-                    self.phase -= 128.0;
+    pub fn next_sample(
+        &mut self,
+        next_freq: u16,
+        attack: u16,
+        decay: u16,
+        sustain: u8,
+        release: u16,
+    ) -> u16 {
+        self.event = match self.event {
+            Event::KeyUp(f) => {
+                if next_freq == 0 {
+                    self.duration = self.duration.saturating_add(1);
+                    Event::KeyUp(f)
+                } else {
+                    self.duration = 0;
+                    Event::KeyDown(next_freq)
                 }
-                if self.phase < 0.0 {
-                    self.phase = 0.0;
-                };
-
-                let envelope = Self::envelope(true, self.duration as u16, attack, decay, sustain);
-
-                let scaled = I16F16::from(SIN_12BIT_128[self.phase as usize])
-                    * I16F16::lossless_try_from(envelope).unwrap();
-
-                let scaled = (clamp(scaled.to_num::<i32>(), -2047, 2047) + 2047) as u16;
-                self.duration += 1;
-                scaled
             }
+            Event::KeyDown(f) => {
+                if next_freq == 0 {
+                    self.duration = 0;
+                    Event::KeyUp(f)
+                } else if next_freq == f {
+                    self.duration = self.duration.saturating_add(1);
+                    Event::KeyDown(next_freq)
+                } else {
+                    self.duration = 0;
+                    Event::KeyDown(next_freq)
+                }
+            }
+        };
+
+        let (key_down, playing_freq) = match self.event {
+            Event::KeyUp(f) => (false, f),
+            Event::KeyDown(f) => (true, f),
+        };
+
+        self.phase += U16F16::from_num(128.0 / 22190.0) * U16F16::from_num(playing_freq);
+        while self.phase >= 128 {
+            self.phase -= U16F16::from_num(128);
         }
+
+        let envelope = Self::envelope(key_down, self.duration, attack, decay, sustain, release);
+
+        let scaled = I16F16::from_num::<i16>(SIN_12BIT_128[u16::lossy_from(self.phase) as usize])
+            * I16F16::lossless_try_from(envelope).unwrap();
+
+        (clamp(scaled.to_num::<i32>(), -2047, 2047) + 2047) as u16
     }
 
-    fn envelope(_key_down: bool, duration: u16, attack: u16, decay: u16, sustain: u8) -> U16F16 {
+    fn envelope(
+        key_down: bool,
+        duration: u32,
+        attack: u16,
+        decay: u16,
+        sustain: u8,
+        release: u16,
+    ) -> U16F16 {
         let attack = attack * 22;
         let decay = decay * 22;
         let sustain = U16F16::from(clamp(sustain, 0, 100)) / 100;
+        let release = release * 22;
 
-        if (0..attack).contains(&duration) {
-            (U16F16::from_num(duration) / U16F16::from_num(attack)).lerp(U16F16::ZERO, U16F16::ONE)
-        } else if (attack..(attack + decay)).contains(&duration) {
-            (U16F16::from_num(duration - attack) / U16F16::from_num(decay))
-                .lerp(U16F16::ONE, sustain)
+        let duration = duration.try_into().unwrap_or(u16::MAX);
+
+        if key_down {
+            if (0..attack).contains(&duration) {
+                (U16F16::from_num(duration) / U16F16::from_num(attack))
+                    .lerp(U16F16::ZERO, U16F16::ONE)
+            } else if (attack..(attack + decay)).contains(&duration) {
+                (U16F16::from_num(duration - attack) / U16F16::from_num(decay))
+                    .lerp(U16F16::ONE, sustain)
+            } else {
+                sustain
+            }
+        } else if (0..release).contains(&duration) {
+            (U16F16::from_num(duration) / U16F16::from_num(release)).lerp(sustain, U16F16::ZERO)
         } else {
-            sustain
+            U16F16::ZERO
         }
     }
 }

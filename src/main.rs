@@ -162,7 +162,7 @@ impl SharedState {
 }
 struct AtomicState {
     input_values: AtomicU32,
-    wave_type: AtomicU16,
+    freq: AtomicU16,
     encoder_value: AtomicI32,
     attack: AtomicU16,
     decay: AtomicU16,
@@ -174,12 +174,12 @@ impl AtomicState {
     pub const fn new() -> Self {
         Self {
             input_values: AtomicU32::new(u32::MAX),
-            wave_type: AtomicU16::new(0),
+            freq: AtomicU16::new(0),
             encoder_value: AtomicI32::new(0),
-            attack: AtomicU16::new(0),
-            decay: AtomicU16::new(0),
-            sustain: AtomicU8::new(100),
-            release: AtomicU16::new(0),
+            attack: AtomicU16::new(100),
+            decay: AtomicU16::new(200),
+            sustain: AtomicU8::new(50),
+            release: AtomicU16::new(900),
         }
     }
 }
@@ -519,7 +519,7 @@ fn DMA_IRQ_0() {
         transfer.check_irq0();
         let (buf, transfer) = transfer.wait();
         let input = ATOMIC_STATE.input_values.load(Ordering::Relaxed);
-        let wave_type = match input {
+        let freq = match input {
             i if (i >> 1 & 1) == 0 => 262,
             i if (i >> 2 & 1) == 0 => 294,
             i if (i >> 3 & 1) == 0 => 330,
@@ -537,14 +537,15 @@ fn DMA_IRQ_0() {
 
         for s in buf.iter_mut() {
             s.a = SYNTH.next_sample(
-                wave_type,
+                freq,
                 ATOMIC_STATE.attack.load(Ordering::Relaxed),
                 ATOMIC_STATE.decay.load(Ordering::Relaxed),
                 ATOMIC_STATE.sustain.load(Ordering::Relaxed),
+                ATOMIC_STATE.release.load(Ordering::Relaxed),
             )
         }
 
-        ATOMIC_STATE.wave_type.store(wave_type, Ordering::Relaxed);
+        ATOMIC_STATE.freq.store(freq, Ordering::Relaxed);
         *PWM_DMA_TRANSFER = Some(transfer.read_next(buf));
     }
 }
