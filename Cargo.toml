@@ -26,6 +26,8 @@ portable-atomic = { version = "1.6", features = [
 panic-persist = { version = "0.3", features = ["utf8"] }
 frunk_core = { version = "0.4.2", default-features = false }
 fixed = "1.24"
+usb-device = { version = "0.2" } # features = ["control-buffer-256"]
+usbd-midi = { git = "https://github.com/rust-midi/usbd-midi.git", rev = "712804f" }
 
 # cargo build/run
 [profile.dev]

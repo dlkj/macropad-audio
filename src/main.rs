@@ -42,6 +42,7 @@ use bsp::{
         pwm::{CcFormat, SliceDmaWrite},
         sio::Sio,
         timer::Instant,
+        usb::UsbBus,
         watchdog::Watchdog,
         Timer,
     },
@@ -62,13 +63,25 @@ use display::Screen;
 use embedded_hal::digital::v2::OutputPin;
 use frunk_core::hlist::{HCons, HNil};
 use hal::fugit::RateExtU32;
-use heapless::{spsc::Queue, String};
+use heapless::{spsc::Queue, String, Vec};
 use leds::LedController;
 use num_traits::clamp;
 use panic_persist as _;
 use portable_atomic::{AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use sh1106::{interface::DisplayInterface, mode::GraphicsMode, Builder};
 use synth::Synth;
+use usb_device::{
+    class_prelude::UsbBusAllocator,
+    device::{UsbDevice, UsbDeviceBuilder, UsbVidPid},
+};
+use usbd_midi::{
+    data::{
+        usb::constants::{USB_AUDIO_CLASS, USB_MIDISTREAMING_SUBCLASS},
+        usb_midi::midi_packet_reader::MidiPacketBufferReader,
+    },
+    midi_device::MidiClass,
+    midi_types::MidiMessage,
+};
 use ws2812_pio::Ws2812;
 
 mod display;
@@ -142,6 +155,9 @@ type PwmDmaTransfer = double_buffer::Transfer<
     double_buffer::ReadNext<&'static mut [CcFormat; PWM_SAMPLE_LEN]>,
 >;
 
+type UsbShared = (UsbDevice<'static, UsbBus>, MidiClass<'static, UsbBus>);
+
+static USB_SHARED: Mutex<RefCell<Option<UsbShared>>> = Mutex::new(RefCell::new(None));
 static SHARED_STATE: Mutex<RefCell<Option<SharedState>>> = Mutex::new(RefCell::new(None));
 static ATOMIC_STATE: AtomicState = AtomicState::new();
 
@@ -150,6 +166,7 @@ const PWM_MAX: u16 = 4096;
 struct SharedState {
     input_pin_group: Option<InputPinGroup>,
     pwm_dma_transfer: Option<PwmDmaTransfer>,
+    midi_messages: Option<Vec<MidiMessage, 16>>,
 }
 
 impl SharedState {
@@ -157,6 +174,7 @@ impl SharedState {
         Self {
             input_pin_group: Some(input_pin_group),
             pwm_dma_transfer: Some(pwm_dma_transfer),
+            midi_messages: None,
         }
     }
 }
@@ -215,12 +233,38 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    static mut USB_ALLOC: Option<UsbBusAllocator<hal::usb::UsbBus>> = None;
+    let usb_alloc = unsafe {
+        USB_ALLOC = Some(UsbBusAllocator::new(hal::usb::UsbBus::new(
+            pac.USBCTRL_REGS,
+            pac.USBCTRL_DPRAM,
+            clocks.usb_clock,
+            true,
+            &mut pac.RESETS,
+        )));
+        USB_ALLOC.as_ref().unwrap()
+    };
+
+    let midi = MidiClass::new(usb_alloc, 1, 1).unwrap();
+
+    let usb_dev = UsbDeviceBuilder::new(usb_alloc, UsbVidPid(0x16c0, 0x8a4))
+        .product("MIDI Test")
+        .device_class(USB_AUDIO_CLASS)
+        .device_sub_class(USB_MIDISTREAMING_SUBCLASS)
+        .build();
+
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
+
+    critical_section::with(|cs| {
+        *USB_SHARED.borrow(cs).borrow_mut() = Some((usb_dev, midi));
+    });
 
     let spi = hal::spi::Spi::<_, _, _>::new(
         pac.SPI1,
@@ -247,8 +291,6 @@ fn main() -> ! {
 
     let mut oled_reset = pins.oled_reset.into_push_pull_output();
     let display = check_for_panic(&mut oled_reset, display);
-
-    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
     let sin = hal::rom_data::float_funcs::fsin::ptr();
 
@@ -320,6 +362,7 @@ fn main() -> ! {
     // Enable interrupts
     unsafe {
         pac::NVIC::unmask(pac::Interrupt::DMA_IRQ_0);
+        pac::NVIC::unmask(hal::pac::Interrupt::USBCTRL_IRQ);
     }
 
     core.SYST.enable_interrupt();
@@ -334,9 +377,25 @@ fn main() -> ! {
     let mut last_input = u32::MAX;
     let mut envelope_field = EnvelopeField::Attack;
 
+    let mut midi_message = MidiMessage::Reset;
+
     loop {
         let now = timer.get_counter();
         if now > next_frame {
+            critical_section::with(|cs| {
+                if let Some(midi_messages) = SHARED_STATE
+                    .borrow(cs)
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|s| s.midi_messages.take())
+                {
+                    midi_message = midi_messages
+                        .first()
+                        .cloned()
+                        .unwrap_or(MidiMessage::Continue);
+                }
+            });
+
             let input = ATOMIC_STATE
                 .input_values
                 .load(portable_atomic::Ordering::Relaxed);
@@ -398,7 +457,7 @@ fn main() -> ! {
             let mut s: String<128> = String::new();
             write!(
                 s,
-                "A: {:03} D: {:03} S: {:03} R: {:03}\n{}\n\n\n\nScreen: {}",
+                "A: {:03} D: {:03} S: {:03} R: {:03}\n{}\n\n\n\nScreen: {}\n\nMidi: {:?}",
                 ATOMIC_STATE.attack.load(Ordering::Relaxed),
                 ATOMIC_STATE.decay.load(Ordering::Relaxed),
                 ATOMIC_STATE.sustain.load(Ordering::Relaxed),
@@ -409,7 +468,8 @@ fn main() -> ! {
                     EnvelopeField::Sustain => "Sustain",
                     EnvelopeField::Release => "Release",
                 },
-                screen
+                screen,
+                midi_message
             )
             .unwrap();
             screen_controller.write(&s).unwrap();
@@ -497,6 +557,7 @@ fn SysTick() {
             *ENCODER_STEP = 0
         }
     }
+    cortex_m::asm::sev();
 }
 
 #[interrupt]
@@ -548,4 +609,31 @@ fn DMA_IRQ_0() {
         ATOMIC_STATE.freq.store(freq, Ordering::Relaxed);
         *PWM_DMA_TRANSFER = Some(transfer.read_next(buf));
     }
+    cortex_m::asm::sev();
+}
+
+#[allow(non_snake_case)]
+#[interrupt]
+fn USBCTRL_IRQ() {
+    critical_section::with(|cs| {
+        if let Some((ref mut usb_device, ref mut midi)) =
+            USB_SHARED.borrow(cs).borrow_mut().as_mut()
+        {
+            if usb_device.poll(&mut [midi]) {
+                let mut buffer = [0; 64];
+
+                if let Ok(size) = midi.read(&mut buffer) {
+                    if let Some(shared) = SHARED_STATE.borrow(cs).borrow_mut().as_mut() {
+                        shared.midi_messages = Some(
+                            MidiPacketBufferReader::new(&buffer, size)
+                                .filter_map(|m| m.map(|p| p.message).ok())
+                                .collect(),
+                        )
+                    }
+                }
+            }
+        }
+    });
+
+    cortex_m::asm::sev();
 }
